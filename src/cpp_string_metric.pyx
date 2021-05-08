@@ -2,22 +2,24 @@
 # cython: language_level=3
 # cython: binding=True
 
+
 from rapidfuzz.utils import default_process
+from cpp_common cimport proc_string, is_valid_string, convert_string, hash_array, hash_sequence#, conv_sequence
+from array import array
+from libc.stdlib cimport malloc, free
 
-cdef extern from "cpp_common.hpp":
-    void validate_string(object py_str, const char* err) except +
+cdef inline proc_string conv_sequence(seq):
+    if is_valid_string(seq):
+        return convert_string(seq)
+    elif isinstance(seq, array):
+        print("test")
+        return hash_array(seq)
+    else:
+        return hash_sequence(seq)
 
-cdef extern from "cpp_string_metric.hpp":
-    object levenshtein_impl(object, object, size_t, size_t, size_t, size_t) nogil except +
-    object levenshtein_impl_default_process(object, object, size_t, size_t, size_t, size_t) nogil except +
-    double normalized_levenshtein_impl(object, object, size_t, size_t, size_t, double) nogil except +
-    double normalized_levenshtein_impl_default_process(object, object, size_t, size_t, size_t, double) nogil except +
-
-    object hamming_impl(object, object, size_t) nogil except +
-    object hamming_impl_default_process(object, object, size_t) nogil except +
-    double normalized_hamming_impl(object, object, double) nogil except +
-    double normalized_hamming_impl_default_process(object, object, double) nogil except +
-
+cdef extern from "cpp_scorer.hpp":
+    object levenshtein_no_process(                proc_string, proc_string, size_t, size_t, size_t, size_t) nogil except +
+    object levenshtein_default_process(           proc_string, proc_string, size_t, size_t, size_t, size_t) nogil except +
 
 def levenshtein(s1, s2, weights=(1,1,1), processor=None, max=None):
     """
@@ -28,19 +30,19 @@ def levenshtein(s1, s2, weights=(1,1,1), processor=None, max=None):
     Parameters
     ----------
     s1 : str
-        First string to compare
+        First string to compare.
     s2 : str
-        Second string to compare
+        Second string to compare.
     weights : Tuple[int, int, int] or None, optional
         The weights for the three operations in the form
         (insertion, deletion, substitution). Default is (1, 1, 1),
         which gives all three operations a weight of 1.
     processor: bool or callable, optional
-      Optional callable that is used to preprocess the strings before
-      comparing them. When processor is True ``utils.default_process``
-      is used. Default is None, which deactivates this behaviour.
+        Optional callable that is used to preprocess the strings before
+        comparing them. When processor is True ``utils.default_process``
+        is used. Default is None, which deactivates this behaviour.
     max : int or None, optional
-        Maximum Levenshtein distance between s1 and s2, that is
+        Maximum distance between s1 and s2, that is
         considered as a result. If the distance is bigger than max,
         -1 is returned instead. Default is None, which deactivates
         this behaviour.
@@ -48,7 +50,12 @@ def levenshtein(s1, s2, weights=(1,1,1), processor=None, max=None):
     Returns
     -------
     distance : int
-        levenshtein distance between s1 and s2
+        distance between s1 and s2
+
+    Raises
+    ------
+    ValueError
+        If unsupported weights are provided a ValueError is thrown
 
     Notes
     -----
@@ -144,7 +151,6 @@ def levenshtein(s1, s2, weights=(1,1,1), processor=None, max=None):
       It has a performance of ``O(N * M)`` and has a memory usage of ``O(N)``.
       Further details can be found in [2]_.
 
-
     References
     ----------
     .. [1] Hyyrö, Heikki. "A Bit-Vector Algorithm for Computing
@@ -181,30 +187,47 @@ def levenshtein(s1, s2, weights=(1,1,1), processor=None, max=None):
     >>> levenshtein("lewenstein", "levenshtein", weights=(1,1,2))
     3
     """
-    cdef size_t insertion = 1
-    cdef size_t deletion = 1
-    cdef size_t substitution = 1
-    cdef size_t max_ = <size_t>-1
-
-    if weights:
+    cdef size_t insertion, deletion, substitution
+    insertion = deletion = substitution = 1
+    if weights is not None:
         insertion, deletion, substitution = weights
 
-    if max is not None:
-        max_ = max
+    cdef size_t c_max = <size_t>-1 if max is None else max
 
     if processor is True or processor == default_process:
-        return levenshtein_impl_default_process(s1, s2, insertion, deletion, substitution, max_)
+        string1 = conv_sequence(s1)
+        try:
+            string2 = conv_sequence(s2)
+            try:
+                return levenshtein_default_process(string1, string2, insertion, deletion, substitution, c_max)
+            finally:
+                if string2.allocated:
+                    free(string2.data)
+        finally:
+            if string1.allocated:
+                free(string1.data)
     elif callable(processor):
         s1 = processor(s1)
         s2 = processor(s2)
 
-    validate_string(s1, "s1 must be a String")
-    validate_string(s2, "s2 must be a String")
+    string1 = conv_sequence(s1)
+    try:
+        string2 = conv_sequence(s2)
+        try:
+            return levenshtein_no_process(string1, string2, insertion, deletion, substitution, c_max)
+        finally:
+            if string2.allocated:
+                free(string2.data)
+    finally:
+        if string1.allocated:
+            free(string1.data)
 
-    return levenshtein_impl(s1, s2, insertion, deletion, substitution, max_)
 
+cdef extern from "cpp_scorer.hpp":
+    double normalized_levenshtein_no_process(     proc_string, proc_string, size_t, size_t, size_t, double) nogil except +
+    double normalized_levenshtein_default_process(proc_string, proc_string, size_t, size_t, size_t, double) nogil except +
 
-def normalized_levenshtein(s1, s2, weights=(1,1,1), processor=None, double score_cutoff=0.0):
+def normalized_levenshtein(s1, s2, weights=(1,1,1), processor=None, score_cutoff=None):
     """
     Calculates a normalized levenshtein distance using custom
     costs for insertion, deletion and substitution.
@@ -220,9 +243,9 @@ def normalized_levenshtein(s1, s2, weights=(1,1,1), processor=None, double score
         (insertion, deletion, substitution). Default is (1, 1, 1),
         which gives all three operations a weight of 1.
     processor: bool or callable, optional
-      Optional callable that is used to preprocess the strings before
-      comparing them. When processor is True ``utils.default_process``
-      is used. Default is None, which deactivates this behaviour.
+        Optional callable that is used to preprocess the strings before
+        comparing them. When processor is True ``utils.default_process``
+        is used. Default is None, which deactivates this behaviour.
     score_cutoff : float, optional
         Optional argument for a score threshold as a float between 0 and 100.
         For ratio < score_cutoff 0 is returned instead. Default is 0,
@@ -230,9 +253,8 @@ def normalized_levenshtein(s1, s2, weights=(1,1,1), processor=None, double score
 
     Returns
     -------
-    ratio : float
-        Normalized weighted levenshtein distance between s1 and s2
-        as a float between 0 and 100
+    similarity : float
+        similarity between s1 and s2 as a float between 0 and 100
 
     Raises
     ------
@@ -285,33 +307,53 @@ def normalized_levenshtein(s1, s2, weights=(1,1,1), processor=None, double score
     >>> normalized_levenshtein("lewenstein", "levenshtein", weights=(1,1,2))
     85.71428571428571
 
-    When a different processor is used s1 and s2 do not have to be strings
+     When a different processor is used s1 and s2 do not have to be strings
 
     >>> normalized_levenshtein(["lewenstein"], ["levenshtein"], processor=lambda s: s[0])
     81.81818181818181
     """
-    cdef size_t insertion = 1
-    cdef size_t deletion = 1
-    cdef size_t substitution = 1
-
     if s1 is None or s2 is None:
         return 0
 
-    if weights:
+    cdef size_t insertion, deletion, substitution
+    insertion = deletion = substitution = 1
+    if weights is not None:
         insertion, deletion, substitution = weights
 
+    cdef double c_score_cutoff = 0.0 if score_cutoff is None else score_cutoff
+
     if processor is True or processor == default_process:
-        return normalized_levenshtein_impl_default_process(
-            s1, s2, insertion, deletion, substitution, score_cutoff)
+        string1 = conv_sequence(s1)
+        try:
+            string2 = conv_sequence(s2)
+            try:
+                return normalized_levenshtein_default_process(string1, string2, insertion, deletion, substitution, c_score_cutoff)
+            finally:
+                if string2.allocated:
+                    free(string2.data)
+        finally:
+            if string1.allocated:
+                free(string1.data)
     elif callable(processor):
         s1 = processor(s1)
         s2 = processor(s2)
 
-    validate_string(s1, "s1 must be a String")
-    validate_string(s2, "s2 must be a String")
+    string1 = conv_sequence(s1)
+    try:
+        string2 = conv_sequence(s2)
+        try:
+            return normalized_levenshtein_no_process(string1, string2, insertion, deletion, substitution, c_score_cutoff)
+        finally:
+            if string2.allocated:
+                free(string2.data)
+    finally:
+        if string1.allocated:
+            free(string1.data)
 
-    return normalized_levenshtein_impl(s1, s2, insertion, deletion, substitution, score_cutoff)
 
+cdef extern from "cpp_scorer.hpp":
+    object hamming_no_process( proc_string, proc_string, size_t) nogil except +
+    object hamming_default_process( proc_string, proc_string, size_t) nogil except +
 
 def hamming(s1, s2, processor=None, max=None):
     """
@@ -327,11 +369,11 @@ def hamming(s1, s2, processor=None, max=None):
     s2 : str
         Second string to compare.
     processor: bool or callable, optional
-      Optional callable that is used to preprocess the strings before
-      comparing them. When processor is True ``utils.default_process``
-      is used. Default is None, which deactivates this behaviour.
+        Optional callable that is used to preprocess the strings before
+        comparing them. When processor is True ``utils.default_process``
+        is used. Default is None, which deactivates this behaviour.
     max : int or None, optional
-        Maximum Hamming distance between s1 and s2, that is
+        Maximum distance between s1 and s2, that is
         considered as a result. If the distance is bigger than max,
         -1 is returned instead. Default is None, which deactivates
         this behaviour.
@@ -339,31 +381,51 @@ def hamming(s1, s2, processor=None, max=None):
     Returns
     -------
     distance : int
-        Hamming distance between s1 and s2
+        distance between s1 and s2
 
     Raises
     ------
     ValueError
         If s1 and s2 have a different length
     """
-    cdef size_t max_ = <size_t>-1
+    cdef size_t c_max = <size_t>-1 if max is None else max
 
-    if max is not None:
-        max_ = max
+    if s1 is None or s2 is None:
+        return 0
 
     if processor is True or processor == default_process:
-        return hamming_impl_default_process(s1, s2, max_)
+        string1 = conv_sequence(s1)
+        try:
+            string2 = conv_sequence(s2)
+            try:
+                return hamming_default_process(string1, string2, c_max)
+            finally:
+                if string2.allocated:
+                    free(string2.data)
+        finally:
+            if string1.allocated:
+                free(string1.data)
     elif callable(processor):
         s1 = processor(s1)
         s2 = processor(s2)
 
-    validate_string(s1, "s1 must be a String")
-    validate_string(s2, "s2 must be a String")
+    string1 = conv_sequence(s1)
+    try:
+        string2 = conv_sequence(s2)
+        try:
+            return hamming_no_process(string1, string2, c_max)
+        finally:
+            if string2.allocated:
+                free(string2.data)
+    finally:
+        if string1.allocated:
+            free(string1.data)
 
-    return hamming_impl(s1, s2, max_)
+cdef extern from "cpp_scorer.hpp":
+    double normalized_hamming_no_process( proc_string, proc_string, double) nogil except +
+    double normalized_hamming_default_process( proc_string, proc_string, double) nogil except +
 
-
-def normalized_hamming(s1, s2, processor=None, double score_cutoff=0.0):
+def normalized_hamming(s1, s2, processor=None, score_cutoff=None):
     """
     Calculates a normalized hamming distance
 
@@ -374,9 +436,9 @@ def normalized_hamming(s1, s2, processor=None, double score_cutoff=0.0):
     s2 : str
         Second string to compare.
     processor: bool or callable, optional
-      Optional callable that is used to preprocess the strings before
-      comparing them. When processor is True ``utils.default_process``
-      is used. Default is None, which deactivates this behaviour.
+        Optional callable that is used to preprocess the strings before
+        comparing them. When processor is True ``utils.default_process``
+        is used. Default is None, which deactivates this behaviour.
     score_cutoff : float, optional
         Optional argument for a score threshold as a float between 0 and 100.
         For ratio < score_cutoff 0 is returned instead. Default is 0,
@@ -384,9 +446,8 @@ def normalized_hamming(s1, s2, processor=None, double score_cutoff=0.0):
 
     Returns
     -------
-    ratio : float
-        Normalized hamming distance between s1 and s2
-        as a float between 0 and 100
+    similarity : float
+        similarity between s1 and s2 as a float between 0 and 100
 
     Raises
     ------
@@ -397,16 +458,35 @@ def normalized_hamming(s1, s2, processor=None, double score_cutoff=0.0):
     --------
     hamming : Hamming distance
     """
+    cdef double c_score_cutoff = 0.0 if score_cutoff is None else score_cutoff
+
     if s1 is None or s2 is None:
         return 0
 
     if processor is True or processor == default_process:
-        return normalized_hamming_impl_default_process(s1, s2, score_cutoff)
+        string1 = conv_sequence(s1)
+        try:
+            string2 = conv_sequence(s2)
+            try:
+                return normalized_hamming_default_process(string1, string2, c_score_cutoff)
+            finally:
+                if string2.allocated:
+                    free(string2.data)
+        finally:
+            if string1.allocated:
+                free(string1.data)
     elif callable(processor):
         s1 = processor(s1)
         s2 = processor(s2)
 
-    validate_string(s1, "s1 must be a String")
-    validate_string(s2, "s2 must be a String")
-
-    return normalized_hamming_impl(s1, s2, score_cutoff)
+    string1 = conv_sequence(s1)
+    try:
+        string2 = conv_sequence(s2)
+        try:
+            return normalized_hamming_no_process(string1, string2, c_score_cutoff)
+        finally:
+            if string2.allocated:
+                free(string2.data)
+    finally:
+        if string1.allocated:
+            free(string1.data)
